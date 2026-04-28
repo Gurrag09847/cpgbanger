@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
@@ -28,27 +29,58 @@ func (a *App) Greet(name string) string {
 	return fmt.Sprintf("Hello %s, It's show time!", name)
 }
 
+// SelectExcelFile opens a file dialog for selecting Excel files
 func (a *App) SelectExcelFile() (string, error) {
-	file, err := runtime.OpenFileDialog(a.ctx, runtime.OpenDialogOptions{
-		DefaultDirectory: ".",
-		Filters: []runtime.FileFilter{{
-			Pattern:     "*.xlsx;",
-			DisplayName: "Excelfil",
-		}},
-		ShowHiddenFiles: true,
+	filePath, err := runtime.OpenFileDialog(a.ctx, runtime.OpenDialogOptions{
+		Title: "Välj Excel-fil",
+		Filters: []runtime.FileFilter{
+			{
+				DisplayName: "Excel Files (*.xlsx)",
+				Pattern:     "*.xlsx",
+			},
+			{
+				DisplayName: "All Files (*.*)",
+				Pattern:     "*.*",
+			},
+		},
 	})
 
 	if err != nil {
+		log.Printf("Error opening file dialog: %v\n", err)
 		return "", err
 	}
 
-	return file, nil
+	log.Printf("Selected file: %s\n", filePath)
+	return filePath, nil
 }
 
-func (a *App) FetchDocuments(params FetchDocumentsParams) {
-	initFetcher(a.ctx, params)
+// FetchDocuments is the main entry point called from the frontend
+func (a *App) FetchDocuments(params FetchParams) error {
+	log.Printf("FetchDocuments called with params: %+v\n", params)
+
+	// Emit start event
+	runtime.EventsEmit(a.ctx, "progress_start", "Starting document fetch...")
+
+	err := a.processFetch(params)
+	if err != nil {
+		log.Printf("Error in FetchDocuments: %v\n", err)
+		runtime.EventsEmit(a.ctx, "progress_error", err.Error())
+		return err
+	}
+
+	log.Println("FetchDocuments completed successfully")
+	return nil
 }
+
+//func (a *App) FetchImages(params FetchImagesParams) {
+//	initImageFetcher(a.ctx, params)
+//}
 
 func (a *App) CancelFetch() {
-	cancelFetcher()
+	log.Println("Cancel requested from frontend")
+	cancelMu.Lock()
+	if cancelFunc != nil {
+		cancelFunc()
+	}
+	cancelMu.Unlock()
 }

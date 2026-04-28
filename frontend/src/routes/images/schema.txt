@@ -5,8 +5,7 @@ export const formSchema = z.object({
     message: "Numret måste vara minst 0"
  }),
  endNumber: z.number().min(0),
- documentType: z.enum(["Produktdatablad", "Säkerhetsdatablad"]).default("Produktdatablad"),
- sheetName: z.enum(["Dokument"]).default("Dokument"),
+ sheetName: z.enum(["Bilder"]).default("Bilder"),
  fileName: z.string().nonempty({
   error: "Välj en fil"
  }),

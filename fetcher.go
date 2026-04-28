@@ -1,10 +1,9 @@
 package main
 
-// validateRowRange validates the row range against actual datapackage main
-
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -15,104 +14,133 @@ import (
 	"github.com/xuri/excelize/v2"
 )
 
-// Global variables with proper synchronization
 var (
 	cancelFunc context.CancelFunc
 	cancelMu   sync.Mutex
 )
 
-// FetchDocumentsParams defines the parameters for document fetching
-type FetchDocumentsParams struct {
-	File         string `json:"file"`
-	StartNumber  int    `json:"startNumber"`
-	EndNumber    int    `json:"endNumber"`
-	SheetName    string `json:"sheetName"`
-	DocumentType string `json:"documentType"`
+type FetchParams struct {
+	File                  string `json:"file"`
+	StartNumber           int    `json:"startNumber"`
+	EndNumber             int    `json:"endNumber"`
+	SheetName             string `json:"sheetName"`
+	ArtikelnummerCol      string `json:"artikelnummerCol"`
+	PDFLinkCol            string `json:"pdfLinkCol"`
+	DocumentType          string `json:"documentType"`
+	UseDocumentTypeColumn bool   `json:"use_document_type_column"`
+	DocumentTypeColumn    string `json:"document_type_column"`
+	Company               string `json:"company"`
+	UpdateDate            bool   `json:"update_date"`
+	DateColumn            string `json:"date_column"`
 }
 
-// DocumentTypes maps user-friendly names to API parameter values
 var documentTypes = map[string]string{
-	"Produktdatablad":   "TechnicalDataSheet",
-	"Säkerhetsdatablad": "SafetySheets",
+	"Produktdatablad":            "TechnicalDataSheet",
+	"Säkerhetsdatablad":          "SafetySheets",
+	"Prestandadeklaration":       "Declaration",
+	"Miljövarudeklaration (EPD)": "EnvironmentalProductDeclaration",
+	"Certifikat":                 "TestCertificationDocument",
 }
 
-// initFetcher processes Excel file and fetches documents
-func initFetcher(ctx context.Context, params FetchDocumentsParams) error {
-	// Validate parameters
-	if err := validateParams(params); err != nil {
-		return fmt.Errorf("parameter validation failed: %w", err)
+var company = map[string]string{
+	"illbruck":  "https://www.illbruck.com/sv-se/teknisk-zon/teknisk-dokumentation/?search=%s&filters=type_%s",
+	"vandex":    "https://www.vandex.com/sv-se/teknisk-zon/teknisk-dokumentation/?search=%s&filters=type_%s",
+	"nullifire": "https://www.nullifire.com/sv-se/teknisk-zon/teknisk-dokumentation/?search=%s&filters=type_%s",
+	"flowcrete": "https://www.flowcrete.eu/sv-se/produkter-golvsystem/soek-produkter-och-golvsystem/?search=%s&filters=type_%s",
+	"matacryl":  "https://www.tremco-europe.com/sv-se/produkter-system/soek-produkter/?search=%s&filters=type_%s",
+	"tremco":    "https://www.tremcocpg.eu/sv-se/produkter-loesningar/teknisk-dokumentation/?search=%s&filters=type_%s",
+}
+
+func findColumnsDynamic(header []string, params FetchParams) (int, int, error) {
+	var artikelnummerIdx, pdfLinkIdx int = -1, -1
+	for i, col := range header {
+		colTrim := strings.TrimSpace(col)
+		if colTrim == params.ArtikelnummerCol {
+			artikelnummerIdx = i
+		}
+		if params.PDFLinkCol != "" && colTrim == params.PDFLinkCol {
+			pdfLinkIdx = i
+		}
+	}
+	if artikelnummerIdx == -1 {
+		return 0, 0, fmt.Errorf("article number column '%s' not found", params.ArtikelnummerCol)
+	}
+	return artikelnummerIdx, pdfLinkIdx, nil
+}
+
+func createPDFColumn(f *excelize.File, sheetName string, header []string) int {
+	colIdx := len(header)
+	cell, _ := excelize.CoordinatesToCellName(colIdx+1, 1)
+	f.SetCellValue(sheetName, cell, "Filnamn eller webblänk")
+	return colIdx
+}
+
+func fetchTechnicalDescription(url, productCode, documentType string) string {
+
+	searchUrl := fmt.Sprintf(url, productCode, documentType)
+
+	client := &http.Client{Timeout: 15 * time.Second}
+
+	req, _ := http.NewRequest("GET", searchUrl, nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	resp, _ := client.Do(req)
+
+	pdf := extractPDFLink(resp)
+	if pdf != "" {
+		return pdf
 	}
 
-	// Create cancellable context
-	var cancelCtx context.Context
+	return "Ingen PDF hittad..."
+}
+
+func extractPDFLink(resp *http.Response) string {
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+	doc, err := goquery.NewDocumentFromReader(resp.Body)
+	if err != nil {
+		return ""
+	}
+	selectors := []string{"a.downloads__action.align-vertical", "a[href*='.pdf']", ".download-link[href*='.pdf']", "a.pdf-download"}
+	for _, sel := range selectors {
+		var found string
+		doc.Find(sel).Each(func(i int, s *goquery.Selection) {
+			if found != "" {
+				return
+			}
+			if link, ok := s.Attr("href"); ok && strings.Contains(strings.ToLower(link), ".pdf") {
+				if strings.HasPrefix(link, "/") {
+					link = "https://www.illbruck.com" + link
+				}
+				found = link
+			}
+		})
+		if found != "" {
+			return found
+		}
+	}
+	return ""
+}
+
+func setupCancellableContext(ctx context.Context) context.Context {
 	cancelMu.Lock()
-	cancelCtx, cancelFunc = context.WithCancel(ctx)
-	cancelMu.Unlock()
-
-	// Ensure cleanup
-	defer func() {
-		cancelMu.Lock()
-		if cancelFunc != nil {
-			cancelFunc()
-			cancelFunc = nil
-		}
-		cancelMu.Unlock()
-	}()
-
-	// Open Excel file
-	f, err := excelize.OpenFile(params.File)
-	if err != nil {
-		return fmt.Errorf("failed to open Excel file: %w", err)
-	}
-	defer f.Close()
-
-	// Get rows from specified sheet
-	rows, err := f.GetRows(params.SheetName)
-	if err != nil {
-		return fmt.Errorf("failed to read sheet '%s': %w", params.SheetName, err)
-	}
-
-	if len(rows) == 0 {
-		return fmt.Errorf("sheet '%s' is empty", params.SheetName)
-	}
-
-	// Find required columns
-	header := rows[0]
-	artikelnummerCol, dokumenttypCol, err := findColumns(header)
-	if err != nil {
-		return err
-	}
-
-	// Find or create PDF link column
-	pdfLinkCol := findOrCreatePDFColumn(f, params.SheetName, header)
-
-	// Validate row range
-	if err := validateRowRange(params, len(rows)); err != nil {
-		return err
-	}
-
-	// Process rows
-	if err := processRows(cancelCtx, f, rows, params, artikelnummerCol, dokumenttypCol, pdfLinkCol); err != nil {
-		return err
-	}
-
-	// Save file if operation wasn't cancelled
-	select {
-	case <-cancelCtx.Done():
-		runtime.EventsEmit(ctx, "progress_cancelled", "Operation cancelled by user")
-		return fmt.Errorf("operation cancelled by user")
-	default:
-		if err := f.SaveAs(params.File); err != nil {
-			return fmt.Errorf("failed to save Excel file: %w", err)
-		}
-	}
-
-	runtime.EventsEmit(ctx, "progress_complete", "Document fetching completed successfully")
-	return nil
+	defer cancelMu.Unlock()
+	cancelCtx, cancel := context.WithCancel(ctx)
+	cancelFunc = cancel
+	return cancelCtx
 }
 
-// validateParams validates the input parameters
-func validateParams(params FetchDocumentsParams) error {
+func cleanupContext() {
+	cancelMu.Lock()
+	defer cancelMu.Unlock()
+	if cancelFunc != nil {
+		cancelFunc()
+		cancelFunc = nil
+	}
+}
+
+func validateParams(params FetchParams) error {
 	if params.File == "" {
 		return fmt.Errorf("file path is required")
 	}
@@ -125,234 +153,168 @@ func validateParams(params FetchDocumentsParams) error {
 	if params.EndNumber < params.StartNumber {
 		return fmt.Errorf("end number must be >= start number")
 	}
-	if _, exists := documentTypes[params.DocumentType]; !exists {
-		return fmt.Errorf("invalid document type: %s", params.DocumentType)
+	// Only validate manual mode
+	if !params.UseDocumentTypeColumn {
+		if params.DocumentType == "" {
+			return fmt.Errorf("document type required unless using type column")
+		}
+		if _, ok := documentTypes[params.DocumentType]; !ok {
+			return fmt.Errorf("invalid document type")
+		}
 	}
 	return nil
 }
 
-// findColumns locates the required columns in the header
-func findColumns(header []string) (int, int, error) {
-	var artikelnummerCol, dokumenttypCol int = -1, -1
+func (a *App) processFetch(params FetchParams) error {
+	if err := validateParams(params); err != nil {
+		return fmt.Errorf("validation error: %w", err)
+	}
 
-	for i, col := range header {
-		col = strings.TrimSpace(col)
-		switch col {
-		case "Leverantörens artikelnummer":
-			artikelnummerCol = i
-		case "Dokumenttyp":
-			dokumenttypCol = i
+	cancelCtx := setupCancellableContext(a.ctx)
+	defer cleanupContext()
+
+	f, err := excelize.OpenFile(params.File)
+	if err != nil {
+		return fmt.Errorf("failed to open Excel file: %w", err)
+	}
+	defer f.Close()
+
+	sheetNames := f.GetSheetList()
+	foundSheet := false
+	for _, s := range sheetNames {
+		if s == params.SheetName {
+			foundSheet = true
+			break
+		}
+	}
+	if !foundSheet {
+		return fmt.Errorf("sheet '%s' not found", params.SheetName)
+	}
+
+	rows, err := f.GetRows(params.SheetName)
+	if err != nil {
+		return fmt.Errorf("failed to read sheet '%s': %w", params.SheetName, err)
+	}
+	if len(rows) == 0 {
+		return fmt.Errorf("sheet '%s' is empty", params.SheetName)
+	}
+
+	header := rows[0]
+	artikelnummerIdx, pdfLinkIdx, err := findColumnsDynamic(header, params)
+	if err != nil {
+		return err
+	}
+
+	if pdfLinkIdx == -1 {
+		pdfLinkIdx = createPDFColumn(f, params.SheetName, header)
+	}
+
+	// Find document type column if needed
+	var docTypeColIdx int = -1
+	if params.UseDocumentTypeColumn {
+		for i, col := range header {
+			if strings.TrimSpace(col) == params.DocumentTypeColumn {
+				docTypeColIdx = i
+				break
+			}
+		}
+		if docTypeColIdx == -1 {
+			return fmt.Errorf("document type column '%s' not found", params.DocumentTypeColumn)
 		}
 	}
 
-	if artikelnummerCol == -1 {
-		return 0, 0, fmt.Errorf("required column 'Leverantörens artikelnummer' not found")
-	}
-	if dokumenttypCol == -1 {
-		return 0, 0, fmt.Errorf("required column 'Dokumenttyp' not found")
-	}
-
-	return artikelnummerCol, dokumenttypCol, nil
-}
-
-// findOrCreatePDFColumn finds existing PDF column or creates a new one
-func findOrCreatePDFColumn(f *excelize.File, sheetName string, header []string) int {
-	// Look for the specific column "Filnamn eller webblänk"
-	for i, col := range header {
-		col = strings.TrimSpace(col)
-		if col == "Filnamn eller webblänk" {
-			return i
-		}
+	// Manual type mapping
+	manualDocType := ""
+	if !params.UseDocumentTypeColumn {
+		manualDocType = documentTypes[params.DocumentType]
 	}
 
-	// Look for other possible PDF/Link columns as fallback
-	for i, col := range header {
-		col = strings.TrimSpace(strings.ToLower(col))
-		if strings.Contains(col, "pdf") || strings.Contains(col, "link") || strings.Contains(col, "dokumentlänk") || strings.Contains(col, "filnamn") || strings.Contains(col, "webblänk") {
-			return i
-		}
-	}
-
-	// Create new column for PDF links if none found
-	pdfLinkCol := len(header)
-	pdfLinkCell, _ := excelize.CoordinatesToCellName(pdfLinkCol+1, 1)
-	f.SetCellValue(sheetName, pdfLinkCell, "Filnamn eller webblänk")
-
-	return pdfLinkCol
-}
-func validateRowRange(params FetchDocumentsParams, totalRows int) error {
-	if params.StartNumber > totalRows {
-		return fmt.Errorf("start number (%d) exceeds total rows (%d)", params.StartNumber, totalRows)
-	}
-	if params.EndNumber > totalRows {
-		return fmt.Errorf("end number (%d) exceeds total rows (%d)", params.EndNumber, totalRows)
-	}
-	return nil
-}
-
-// processRows processes the specified range of rows
-func processRows(ctx context.Context, f *excelize.File, rows [][]string, params FetchDocumentsParams, artikelnummerCol, dokumenttypCol, pdfLinkCol int) error {
-	startIndex := params.StartNumber - 1 // Convert to 0-based index
+	startIndex := params.StartNumber - 1
 	endIndex := params.EndNumber
-
-	// Ensure we don't exceed array bounds
 	if endIndex > len(rows) {
 		endIndex = len(rows)
 	}
 
 	totalRows := endIndex - startIndex
-	docType := documentTypes[params.DocumentType]
 
+	searchCompany, ok := company[params.Company]
+	if !ok {
+		return fmt.Errorf("no company found")
+	}
+
+	processedCount := 0
 	for i := startIndex; i < endIndex; i++ {
 		select {
-		case <-ctx.Done():
-			runtime.EventsEmit(ctx, "progress_cancelled", "Operation cancelled during processing")
+		case <-cancelCtx.Done():
+			runtime.EventsEmit(a.ctx, "progress_cancelled", "Operation cancelled")
 			return fmt.Errorf("operation cancelled")
 		default:
 			row := rows[i]
 
-			// Skip if row doesn't have enough columns
-			if len(row) <= artikelnummerCol {
+			if len(row) <= artikelnummerIdx {
 				continue
 			}
 
-			artNum := strings.TrimSpace(row[artikelnummerCol])
-
-			// Skip if article number is too short
+			artNum := strings.TrimSpace(row[artikelnummerIdx])
 			if len(artNum) < 5 {
 				continue
 			}
 
-			// Add small delay to avoid overwhelming the server
-			time.Sleep(100 * time.Millisecond)
+			// Determine document type
+			var docType string
+			if params.UseDocumentTypeColumn {
+				if len(row) <= docTypeColIdx {
+					continue
+				}
+				excelDocType := strings.TrimSpace(row[docTypeColIdx])
+				mapped, ok := documentTypes[excelDocType]
+				if !ok {
+					log.Printf("Row %d has unknown document type '%s'\n", i+1, excelDocType)
+					continue
+				}
+				docType = mapped
+			} else {
+				docType = manualDocType
+			}
 
 			productCode := artNum[:5]
-			pdfLink := fetchTechnicalDescription(productCode, docType)
+			pdfLink := fetchTechnicalDescription(searchCompany, productCode, docType)
 
-			// Update progress
+			excelRow := i + 1
+			pdfCell, _ := excelize.CoordinatesToCellName(pdfLinkIdx+1, excelRow)
+			f.SetCellValue(params.SheetName, pdfCell, pdfLink)
+
+			// Update date column
+			if params.UpdateDate && params.DateColumn != "" {
+				dateIdx, err := findDateColumn(header, params.DateColumn)
+				if err == nil {
+					dateCell, _ := excelize.CoordinatesToCellName(dateIdx+1, excelRow)
+					f.SetCellValue(params.SheetName, dateCell, time.Now().Format("2006-01-02"))
+				}
+			}
+
+			processedCount++
 			progress := float64(i-startIndex+1) / float64(totalRows) * 100
-			runtime.EventsEmit(ctx, "progress_update", progress)
-
-			// Update Excel cells (1-based indexing)
-			excelRowNum := i + 1
-
-			// Update document type column
-			dokumenttypCell, err := excelize.CoordinatesToCellName(dokumenttypCol+1, excelRowNum)
-			if err != nil {
-				return fmt.Errorf("failed to get cell coordinates: %w", err)
-			}
-			f.SetCellValue(params.SheetName, dokumenttypCell, params.DocumentType)
-
-			// Update PDF link column
-			pdfLinkCell, err := excelize.CoordinatesToCellName(pdfLinkCol+1, excelRowNum)
-			if err != nil {
-				return fmt.Errorf("failed to get cell coordinates: %w", err)
-			}
-			f.SetCellValue(params.SheetName, pdfLinkCell, pdfLink)
+			runtime.EventsEmit(a.ctx, "progress_update", progress)
+			time.Sleep(100 * time.Millisecond)
 		}
 	}
+
+	if err := f.SaveAs(params.File); err != nil {
+		return fmt.Errorf("failed to save file: %w", err)
+	}
+
+	runtime.EventsEmit(a.ctx, "progress_complete",
+		fmt.Sprintf("Completed! Processed %d of %d rows", processedCount, totalRows))
 
 	return nil
 }
 
-// fetchTechnicalDescription fetches PDF link for a product code
-func fetchTechnicalDescription(productCode, documentType string) string {
-
-	// Multiple search strategies with decreasing specificity
-	searchURLs := []string{
-		fmt.Sprintf("https://www.illbruck.com/sv-se/teknisk-zon/teknisk-dokumentation/?search=%s&filters=type_%s", productCode, documentType),
-		fmt.Sprintf("https://www.vandex.com/sv-se/teknisk-zon/teknisk-dokumentation/?search=%s&filters=type_%s", productCode[:4], documentType),
-		fmt.Sprintf("https://www.nullifire.com/sv-se/teknisk-zon/teknisk-dokumentation/?search=%s&filters=type_%s", productCode[:3], documentType),
-	}
-
-	client := &http.Client{
-		Timeout: 15 * time.Second,
-		Transport: &http.Transport{
-			MaxIdleConns:       10,
-			IdleConnTimeout:    30 * time.Second,
-			DisableCompression: false,
-		},
-	}
-
-	for i, url := range searchURLs {
-		// Add delay between requests to be respectful
-		if i > 0 {
-			time.Sleep(200 * time.Millisecond)
-		}
-
-		req, err := http.NewRequest("GET", url, nil)
-		if err != nil {
-			continue
-		}
-
-		// Set realistic headers
-		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
-		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-		req.Header.Set("Accept-Language", "sv-SE,sv;q=0.9,en;q=0.8")
-
-		resp, err := client.Do(req)
-		if err != nil {
-			continue
-		}
-
-		// Process response and look for PDF links
-		pdfLink := func() string {
-			defer resp.Body.Close()
-
-			if resp.StatusCode != http.StatusOK {
-				return ""
-			}
-
-			doc, err := goquery.NewDocumentFromReader(resp.Body)
-			if err != nil {
-				return ""
-			}
-
-			// Look for PDF download links with multiple selectors
-			selectors := []string{
-				"a.downloads__action.align-vertical",
-				"a[href*='.pdf']",
-				".download-link[href*='.pdf']",
-				"a.pdf-download",
-			}
-
-			for _, selector := range selectors {
-				var foundLink string
-				doc.Find(selector).Each(func(i int, s *goquery.Selection) {
-					if foundLink != "" {
-						return // Already found a link
-					}
-					if link, exists := s.Attr("href"); exists && strings.Contains(strings.ToLower(link), ".pdf") {
-						// Make relative URLs absolute
-						if strings.HasPrefix(link, "/") {
-							link = "https://www.illbruck.com" + link
-						}
-						foundLink = link
-					}
-				})
-				if foundLink != "" {
-					return foundLink
-				}
-			}
-			return ""
-		}()
-
-		// If we found a PDF link, return it
-		if pdfLink != "" {
-			return pdfLink
+func findDateColumn(header []string, dateColumn string) (int, error) {
+	for i, col := range header {
+		if strings.TrimSpace(col) == dateColumn {
+			return i, nil
 		}
 	}
-
-	return "Ingen PDF hittad..."
-}
-
-// cancelFetcher cancels the current fetch operation
-func cancelFetcher() {
-	cancelMu.Lock()
-	defer cancelMu.Unlock()
-
-	if cancelFunc != nil {
-		cancelFunc()
-		cancelFunc = nil
-	}
+	return -1, fmt.Errorf("date column '%s' not found", dateColumn)
 }

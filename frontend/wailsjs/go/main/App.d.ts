@@ -4,7 +4,7 @@ import {main} from '../models';
 
 export function CancelFetch():Promise<void>;
 
-export function FetchDocuments(arg1:main.FetchDocumentsParams):Promise<void>;
+export function FetchDocuments(arg1:main.FetchParams):Promise<void>;
 
 export function Greet(arg1:string):Promise<string>;
 

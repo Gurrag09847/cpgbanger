@@ -1,0 +1,263 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/PuerkitoBio/goquery"
+	"github.com/wailsapp/wails/v2/pkg/runtime"
+	"github.com/xuri/excelize/v2"
+)
+
+type FetchImagesParams struct {
+	FetchParams
+}
+
+func findOrCreateImageColumn(f *excelize.File, sheetName string, header []string) int {
+	// Look for the specific column "Filnamn eller webblänk" (same as PDF column)
+	for i, col := range header {
+		col = strings.TrimSpace(col)
+		if col == "Filnamn eller webblänk" {
+			return i
+		}
+	}
+
+	// Create new column with the same name as document column if none found
+	imageLinkCol := len(header)
+	imageLinkCell, _ := excelize.CoordinatesToCellName(imageLinkCol+1, 1)
+	f.SetCellValue(sheetName, imageLinkCell, "Filnamn eller webblänk")
+
+	return imageLinkCol
+}
+
+func initImageFetcher(ctx context.Context, params FetchImagesParams) error {
+	// Validate parameters
+	if err := validateCommonParams(params.FetchParams); err != nil {
+		return fmt.Errorf("parameter validation failed: %w", err)
+	}
+
+	// Create cancellable context
+	cancelCtx := setupCancellableContext(ctx)
+	defer cleanupContext()
+
+	// Setup Excel processor
+	processor, err := setupExcelProcessor(params.FetchParams)
+	if err != nil {
+		return err
+	}
+	defer processor.file.Close()
+
+	// Find or create image link column
+	imageLinkCol := findOrCreateImageColumn(processor.file, processor.sheetName, processor.rows[0])
+
+	// Validate row range
+	if err := validateRowRange(params.StartNumber, params.EndNumber, len(processor.rows)); err != nil {
+		return err
+	}
+
+	// Process rows for images
+	if err := processImageRows(cancelCtx, processor, params, imageLinkCol); err != nil {
+		return err
+	}
+
+	// Save file if operation wasn't cancelled
+	select {
+	case <-cancelCtx.Done():
+		runtime.EventsEmit(ctx, "progress_cancelled", "Operation cancelled by user")
+		return fmt.Errorf("operation cancelled by user")
+	default:
+		if err := processor.file.SaveAs(params.File); err != nil {
+			return fmt.Errorf("failed to save Excel file: %w", err)
+		}
+	}
+
+	runtime.EventsEmit(ctx, "progress_complete", "Image fetching completed successfully")
+	return nil
+}
+
+func processImageRows(ctx context.Context, processor *ExcelProcessor, params FetchImagesParams, imageLinkCol int) error {
+	startIndex := params.StartNumber - 1
+	endIndex := params.EndNumber
+	if endIndex > len(processor.rows) {
+		endIndex = len(processor.rows)
+	}
+
+	totalRows := endIndex - startIndex
+
+	for i := startIndex; i < endIndex; i++ {
+		select {
+		case <-ctx.Done():
+			runtime.EventsEmit(ctx, "progress_cancelled", "Operation cancelled during processing")
+			return fmt.Errorf("operation cancelled")
+		default:
+			row := processor.rows[i]
+
+			if len(row) <= processor.artikelnummerCol {
+				continue
+			}
+
+			artNum := strings.TrimSpace(row[processor.artikelnummerCol])
+			if len(artNum) < 5 {
+				continue
+			}
+
+			time.Sleep(100 * time.Millisecond)
+
+			productCode := artNum[:5]
+			imageLink := fetchProductImage(productCode)
+
+			progress := float64(i-startIndex+1) / float64(totalRows) * 100
+			runtime.EventsEmit(ctx, "progress_update", progress)
+
+			excelRowNum := i + 1
+
+			// Update image link column
+			imageLinkCell, err := excelize.CoordinatesToCellName(imageLinkCol+1, excelRowNum)
+			if err != nil {
+				return fmt.Errorf("failed to get cell coordinates: %w", err)
+			}
+			processor.file.SetCellValue(processor.sheetName, imageLinkCell, imageLink)
+		}
+	}
+
+	return nil
+}
+
+func fetchProductImage(productCode string) string {
+
+	type Link struct {
+		hostname string
+		url      string
+	}
+
+	searchURLs := []Link{
+		{
+			url:      fmt.Sprintf("https://www.illbruck.com/sv-se/produkter/soek-produkter/?search=%s#product-search", productCode),
+			hostname: "https://www.illbruck.com",
+		},
+		{
+			url:      fmt.Sprintf("https://www.vandex.com/sv-se/produkter/soek-produkter/?search=%s#product-search", productCode),
+			hostname: "https://www.vandex.com",
+		},
+		{
+			url:      fmt.Sprintf("https://www.nullifire.com/sv-se/produkter/soek-produkter/?search=%s#product-search", productCode),
+			hostname: "https://www.nullifire.com",
+		},
+	}
+
+	client := createHTTPClient()
+
+	for i, url := range searchURLs {
+		if i > 0 {
+			time.Sleep(100 * time.Millisecond)
+		}
+
+		imageLink := searchForImage(client, url.url, url.hostname)
+		if imageLink != "" {
+			return imageLink
+		}
+	}
+
+	return "Ingen bild hittad..."
+}
+
+func searchForImage(client *http.Client, url, hostname string) string {
+	fmt.Println("🔍 Searching for product image at URL:", url)
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		fmt.Println("❌ Failed to create request:", err)
+		return ""
+	}
+
+	setCommonHeaders(req)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Println("❌ HTTP request error:", err)
+		return ""
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		fmt.Println("❌ Non-200 response:", resp.StatusCode)
+		return ""
+	}
+
+	doc, err := goquery.NewDocumentFromReader(resp.Body)
+	if err != nil {
+		fmt.Println("❌ Failed to parse search page HTML:", err)
+		return ""
+	}
+
+	var productLink string
+	doc.Find("a.simple-card").EachWithBreak(func(i int, s *goquery.Selection) bool {
+		if href, exists := s.Attr("href"); exists && strings.Contains(href, "/produkter/") {
+			productLink = hostname + href
+			fmt.Println("➡️ Found product link:", productLink)
+			return false // break
+		}
+		return true
+	})
+	if productLink == "" {
+		fmt.Println("⚠️ No product link found.")
+		return ""
+	}
+
+	req2, err := http.NewRequest("GET", productLink, nil)
+	if err != nil {
+		fmt.Println("❌ Failed to create product detail request:", err)
+		return ""
+	}
+	setCommonHeaders(req2)
+
+	resp2, err := client.Do(req2)
+	if err != nil {
+		fmt.Println("❌ Error fetching product page:", err)
+		return ""
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		fmt.Println("❌ Non-200 response from product page:", resp2.StatusCode)
+		return ""
+	}
+
+	doc2, err := goquery.NewDocumentFromReader(resp2.Body)
+	if err != nil {
+		fmt.Println("❌ Failed to parse product page HTML:", err)
+		return ""
+	}
+
+	imageSelectors := []string{
+		".image-carousel__image-wrapper.is-active img",
+		"img.image-carousel__image",
+		".product-media img",
+		".product-gallery img",
+		"img[src*='.jpg']",
+		"img[src*='.png']",
+		"img[src*='.jpeg']",
+	}
+
+	for _, selector := range imageSelectors {
+		fmt.Println("🔎 Looking for images with selector:", selector)
+		var foundImage string
+		doc2.Find(selector).Each(func(i int, s *goquery.Selection) {
+			if foundImage != "" {
+				return
+			}
+			if src, exists := s.Attr("src"); exists {
+				foundImage = src
+			}
+		})
+		if foundImage != "" {
+			fmt.Println("✅ Found image:", foundImage)
+			return foundImage
+		}
+	}
+
+	fmt.Println("❌ No image found.")
+	return "Ingen bild hittades..."
+}
