@@ -12,7 +12,7 @@ toasts.subscribe((v) => {
 });
 
 export function addToast(message: string, variant: Toast['variant'] = 'success') {
-	const id = crypto.randomUUID();
+	const id = crypto.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 	toasts.update((t) => [...t, { id, message, variant }]);
 	timeoutIds[id] = setTimeout(() => {
 		toasts.update((t) => t.filter((x) => x.id !== id));
