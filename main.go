@@ -1,77 +1,140 @@
 package main
 
 import (
+	"context"
 	"embed"
-
-	"github.com/wailsapp/wails/v2"
-	"github.com/wailsapp/wails/v2/pkg/options"
-	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
-	// tea "github.com/charmbracelet/bubbletea"
+	"io"
+	"io/fs"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"time"
 )
 
 //go:embed all:frontend/dist
-var assets embed.FS
+var embeddedAssets embed.FS
 
-// type model struct {
-// 	company string
-// }
+var assetsFS fs.FS
 
-// func initialModel() model {
-// 	return model{
-// 		company: "Illbruck",
-// 	}
-// }
-
-// func (m model) Init() tea.Cmd {
-// 	return nil
-// }
-
-// func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-
-// 	switch msg := msg.(type) {
-// 	case tea.KeyMsg:
-// 		switch msg.String() {
-// 		case "ctrl+c", "q":
-// 			return m, tea.Quit
-// 		}
-// 	}
-
-// 	return m, nil
-// }
-
-// func (m model) View() string {
-
-// 	return m.company
-// }
+func init() {
+	var err error
+	assetsFS, err = fs.Sub(embeddedAssets, "frontend/dist")
+	if err != nil {
+		panic(err)
+	}
+}
 
 func main() {
-	//Create an instance of the app structure
-	app := NewApp()
-
-	// Create application with options
-	err := wails.Run(&options.App{
-		Title:  "Tremco Excel-Synk",
-		Width:  1024,
-		Height: 768,
-		AssetServer: &assetserver.Options{
-			Assets: assets,
-		},
-		BackgroundColour: &options.RGBA{R: 255, G: 255, B: 255, A: 1},
-		OnStartup:        app.startup,
-		Bind: []interface{}{
-			app,
-		},
-	})
-
-	if err != nil {
-		println("Error:", err.Error())
+	dataDir := "data"
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		log.Fatalf("Failed to create data directory: %v", err)
 	}
 
-	// fmt.Println("Hello World")
+	uploadDir := filepath.Join(dataDir, "uploads")
+	if err := os.MkdirAll(uploadDir, 0755); err != nil {
+		log.Fatalf("Failed to create uploads directory: %v", err)
+	}
 
-	// p := tea.NewProgram(initialModel())
-	// if _, err := p.Run(); err != nil {
-	// 	fmt.Printf("Alas, there's been an error: %v", err)
-	// 	os.Exit(1)
-	// }
+	dbPath := filepath.Join(dataDir, "tremco.db")
+	db, err := initDB(dbPath)
+	if err != nil {
+		log.Fatalf("Failed to initialize database: %v", err)
+	}
+	defer db.Close()
+
+	server := NewServer(db, uploadDir, dbPath)
+	server.StartScheduler()
+
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+
+	spa := spaHandler(http.FS(assetsFS))
+	mux.HandleFunc("/", spa)
+
+	addr := getEnv("ADDR", ":8080")
+	httpServer := &http.Server{
+		Addr:         addr,
+		Handler:      corsMiddleware(mux),
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 30 * time.Minute,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	go func() {
+		log.Printf("Server starting on http://localhost%s\n", addr)
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server failed: %v", err)
+		}
+	}()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+	log.Println("Shutting down server...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := httpServer.Shutdown(ctx); err != nil {
+		log.Fatalf("Server forced to shutdown: %v", err)
+	}
+	log.Println("Server stopped")
+}
+
+func spaHandler(assets http.FileSystem) http.HandlerFunc {
+	fileServer := http.FileServer(assets)
+	return func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			http.NotFound(w, r)
+			return
+		}
+
+		path := strings.TrimPrefix(r.URL.Path, "/")
+
+		f, err := assets.Open(path)
+		if err == nil {
+			f.Close()
+			fileServer.ServeHTTP(w, r)
+			return
+		}
+
+		index, err := assets.Open("index.html")
+		if err != nil {
+			http.Error(w, "Not found", http.StatusNotFound)
+			return
+		}
+		defer index.Close()
+
+		data, err := io.ReadAll(index)
+		if err != nil {
+			http.Error(w, "Internal error", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write(data)
+	}
+}
+
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func getEnv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }

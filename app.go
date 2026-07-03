@@ -2,85 +2,63 @@ package main
 
 import (
 	"context"
-	"fmt"
-	"log"
-
-	"github.com/wailsapp/wails/v2/pkg/runtime"
+	"sync"
 )
 
-// App struct
-type App struct {
-	ctx context.Context
+type JobUpdate struct {
+	Status    string  `json:"status"`
+	Progress  float64 `json:"progress"`
+	Processed int     `json:"processed"`
+	Total     int     `json:"total"`
+	Error     string  `json:"error,omitempty"`
 }
 
-// NewApp creates a new App application struct
-func NewApp() *App {
-	return &App{}
+type jobBroadcaster struct {
+	mu          sync.Mutex
+	subscribers map[int64]chan JobUpdate
+	nextID      int64
+	current     JobUpdate
 }
 
-// startup is called when the app starts. The context is saved
-// so we can call the runtime methods
-func (a *App) startup(ctx context.Context) {
-	a.ctx = ctx
-}
-
-// Greet returns a greeting for the given name
-func (a *App) Greet(name string) string {
-	return fmt.Sprintf("Hello %s, It's show time!", name)
-}
-
-// SelectExcelFile opens a file dialog for selecting Excel files
-func (a *App) SelectExcelFile() (string, error) {
-	filePath, err := runtime.OpenFileDialog(a.ctx, runtime.OpenDialogOptions{
-		Title: "Välj Excel-fil",
-		Filters: []runtime.FileFilter{
-			{
-				DisplayName: "Excel Files (*.xlsx)",
-				Pattern:     "*.xlsx",
-			},
-			{
-				DisplayName: "All Files (*.*)",
-				Pattern:     "*.*",
-			},
-		},
-	})
-
-	if err != nil {
-		log.Printf("Error opening file dialog: %v\n", err)
-		return "", err
+func newJobBroadcaster() *jobBroadcaster {
+	return &jobBroadcaster{
+		subscribers: make(map[int64]chan JobUpdate),
 	}
-
-	log.Printf("Selected file: %s\n", filePath)
-	return filePath, nil
 }
 
-// FetchDocuments is the main entry point called from the frontend
-func (a *App) FetchDocuments(params FetchParams) error {
-	log.Printf("FetchDocuments called with params: %+v\n", params)
-
-	// Emit start event
-	runtime.EventsEmit(a.ctx, "progress_start", "Starting document fetch...")
-
-	err := a.processFetch(params)
-	if err != nil {
-		log.Printf("Error in FetchDocuments: %v\n", err)
-		runtime.EventsEmit(a.ctx, "progress_error", err.Error())
-		return err
+func (b *jobBroadcaster) subscribe() (chan JobUpdate, func()) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	ch := make(chan JobUpdate, 64)
+	id := b.nextID
+	b.nextID++
+	b.subscribers[id] = ch
+	ch <- b.current
+	return ch, func() {
+		b.mu.Lock()
+		delete(b.subscribers, id)
+		b.mu.Unlock()
 	}
-
-	log.Println("FetchDocuments completed successfully")
-	return nil
 }
 
-//func (a *App) FetchImages(params FetchImagesParams) {
-//	initImageFetcher(a.ctx, params)
-//}
-
-func (a *App) CancelFetch() {
-	log.Println("Cancel requested from frontend")
-	cancelMu.Lock()
-	if cancelFunc != nil {
-		cancelFunc()
+func (b *jobBroadcaster) broadcast(u JobUpdate) {
+	b.mu.Lock()
+	b.current = u
+	for _, ch := range b.subscribers {
+		select {
+		case ch <- u:
+		default:
+		}
 	}
-	cancelMu.Unlock()
+	b.mu.Unlock()
+}
+
+type PendingJob struct {
+	ID          string
+	Params      FetchParams
+	FilePath    string
+	FileName    string
+	Ctx         context.Context
+	Cancel      context.CancelFunc
+	Broadcaster *jobBroadcaster
 }
