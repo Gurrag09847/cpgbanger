@@ -49,10 +49,11 @@ var companyURLs = map[string]string{
 type progressCB func(processed, total int)
 
 type rowTask struct {
-	excelRow int
-	sheet    string
-	artNum   string
-	docType  string
+	excelRow   int
+	sheet      string
+	artNum     string
+	docType    string
+	existingPDF string
 }
 
 type sheetWrite struct {
@@ -184,37 +185,43 @@ func runFetch(job *PendingJob, report progressCB) error {
 			default:
 			}
 
-			row := rows[i]
-			if len(row) <= artikelnummerIdx {
+		row := rows[i]
+		if len(row) <= artikelnummerIdx {
+			continue
+		}
+		artNum := strings.TrimSpace(row[artikelnummerIdx])
+		if len(artNum) < 5 {
+			continue
+		}
+
+		var docType string
+		if params.UseDocumentTypeColumn {
+			if len(row) <= docTypeColIdx {
 				continue
 			}
-			artNum := strings.TrimSpace(row[artikelnummerIdx])
-			if len(artNum) < 5 {
+			excelDocType := strings.TrimSpace(row[docTypeColIdx])
+			mapped, ok := documentTypes[excelDocType]
+			if !ok {
+				log.Printf("Row %d in '%s' has unknown document type '%s'\n", i+1, sheetName, excelDocType)
 				continue
 			}
+			docType = mapped
+		} else {
+			docType = manualDocType
+		}
 
-			var docType string
-			if params.UseDocumentTypeColumn {
-				if len(row) <= docTypeColIdx {
-					continue
-				}
-				excelDocType := strings.TrimSpace(row[docTypeColIdx])
-				mapped, ok := documentTypes[excelDocType]
-				if !ok {
-					log.Printf("Row %d in '%s' has unknown document type '%s'\n", i+1, sheetName, excelDocType)
-					continue
-				}
-				docType = mapped
-			} else {
-				docType = manualDocType
-			}
+		var existingPDF string
+		if pdfLinkIdx >= 0 && len(row) > pdfLinkIdx {
+			existingPDF = strings.TrimSpace(row[pdfLinkIdx])
+		}
 
-			sheetTasks = append(sheetTasks, rowTask{
-				excelRow: i + 1,
-				sheet:    sheetName,
-				artNum:   artNum,
-				docType:  docType,
-			})
+		sheetTasks = append(sheetTasks, rowTask{
+			excelRow:   i + 1,
+			sheet:      sheetName,
+			artNum:     artNum,
+			docType:    docType,
+			existingPDF: existingPDF,
+		})
 		}
 
 		sheetDataMap = append(sheetDataMap, sheetData{
@@ -246,28 +253,29 @@ func runFetch(job *PendingJob, report progressCB) error {
 	var wg sync.WaitGroup
 	for w := 0; w < concurrency; w++ {
 		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for task := range taskCh {
-				select {
-				case <-job.Ctx.Done():
-					return
-				default:
-				}
-				productCode := task.artNum[:5]
-				pdfLink := fetchTechnicalDescription(searchURL, productCode, task.docType)
-				select {
-				case resultCh <- rowTask{
-					excelRow: task.excelRow,
-					sheet:    task.sheet,
-					artNum:   pdfLink,
-					docType:  "",
-				}:
-				case <-job.Ctx.Done():
-					return
-				}
+	go func() {
+		defer wg.Done()
+		for task := range taskCh {
+			select {
+			case <-job.Ctx.Done():
+				return
+			default:
 			}
-		}()
+			productCode := task.artNum[:5]
+			pdfLink := fetchTechnicalDescription(searchURL, productCode, task.docType)
+			select {
+			case resultCh <- rowTask{
+				excelRow:    task.excelRow,
+				sheet:       task.sheet,
+				artNum:      pdfLink,
+				docType:     "",
+				existingPDF: task.existingPDF,
+			}:
+			case <-job.Ctx.Done():
+				return
+			}
+		}
+	}()
 	}
 
 	go func() {
@@ -304,12 +312,17 @@ loop:
 			if !ok {
 				break loop
 			}
-			key := fmt.Sprintf("%s_%d", result.sheet, result.excelRow)
-			sheetIdx := sheetTaskIndex[key]
-			sd := &sheetDataMap[sheetIdx]
+		key := fmt.Sprintf("%s_%d", result.sheet, result.excelRow)
+		sheetIdx := sheetTaskIndex[key]
+		sd := &sheetDataMap[sheetIdx]
 
-			pdfCell, _ := excelize.CoordinatesToCellName(sd.write.pdfLinkIdx+1, result.excelRow)
-			f.SetCellValue(result.sheet, pdfCell, result.artNum)
+		valueToWrite := result.artNum
+		if strings.Contains(result.artNum, "hittad") && result.existingPDF != "" {
+			valueToWrite = result.existingPDF
+		}
+
+		pdfCell, _ := excelize.CoordinatesToCellName(sd.write.pdfLinkIdx+1, result.excelRow)
+		f.SetCellValue(result.sheet, pdfCell, valueToWrite)
 
 			if sd.write.dateIdx >= 0 {
 				dateCell, _ := excelize.CoordinatesToCellName(sd.write.dateIdx+1, result.excelRow)
